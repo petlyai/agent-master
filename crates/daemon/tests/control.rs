@@ -15,14 +15,18 @@ async fn nothing_runs_until_something_is_started() {
 #[tokio::test]
 async fn every_operation_says_so_before_a_process_exists() {
     let mut master = master().await;
-    assert_eq!(refusal(master.window().await.expect_err("window")), Refusal::NothingStarted);
-    assert_eq!(refusal(master.input(b"x").await.expect_err("input")), Refusal::NothingStarted);
+    assert_eq!(refusal(master.window().await.expect_err("window")), Refusal::NotStarted);
+    assert_eq!(refusal(master.input(b"x").await.expect_err("input")), Refusal::NotStarted);
     let size = WindowSize { rows: 10, cols: 40 };
-    assert_eq!(refusal(master.resize(size).await.expect_err("resize")), Refusal::NothingStarted);
+    assert_eq!(refusal(master.resize(size).await.expect_err("resize")), Refusal::NotStarted);
     let grace = Duration::from_secs(1);
-    assert_eq!(refusal(master.stop(grace).await.expect_err("stop")), Refusal::NothingStarted);
+    assert_eq!(refusal(master.stop(grace).await.expect_err("stop")), Refusal::NotStarted);
     let refused = master.clipboard().await.expect_err("clipboard");
-    assert_eq!(refusal(refused), Refusal::NothingStarted);
+    assert_eq!(refusal(refused), Refusal::NotStarted);
+    let refused = master.send("x".to_string()).await.expect_err("send");
+    assert_eq!(refusal(refused), Refusal::NotStarted);
+    let refused = master.messages(0).await.expect_err("messages");
+    assert_eq!(refusal(refused), Refusal::NotStarted);
     assert_eq!(master.state().await.expect("state"), State::NotStarted);
 }
 
@@ -93,7 +97,7 @@ async fn the_given_environment_wins_over_the_inherited_one() {
 async fn the_process_sees_the_size_it_was_started_with() {
     let mut master = master().await;
     let mut spec = shell("stty size");
-    spec.size = WindowSize { rows: 30, cols: 100 };
+    spec.terminal = Some(WindowSize { rows: 30, cols: 100 });
     master.start(spec).await.expect("start");
     let window = master.window().await.expect("window");
     assert_eq!(window.size, WindowSize { rows: 30, cols: 100 });
@@ -122,7 +126,7 @@ async fn a_window_too_small_to_draw_is_refused_at_the_start() {
         WindowSize { rows: 24, cols: 1 },
     ] {
         let mut spec = shell("echo hello");
-        spec.size = size;
+        spec.terminal = Some(size);
         let refused = refusal(master.start(spec).await.expect_err("start"));
         assert_eq!(
             refused,
@@ -133,7 +137,7 @@ async fn a_window_too_small_to_draw_is_refused_at_the_start() {
     }
     let smallest = WindowSize { rows: 2, cols: 2 };
     let mut spec = shell("echo hello");
-    spec.size = smallest;
+    spec.terminal = Some(smallest);
     master.start(spec).await.expect("the smallest drawable window is allowed");
     assert_eq!(master.window().await.expect("window").size, smallest);
 }
@@ -573,4 +577,41 @@ async fn an_unreadable_request_is_answered_without_dropping_the_connection() {
         }
         _ => panic!("the connection did not survive the unreadable request"),
     }
+}
+
+#[tokio::test]
+async fn a_request_about_a_named_process_cannot_carry_one_about_another() {
+    use agent_master_protocol::{read_message, write_message, Incoming, Request, Response};
+    use tokio::io::BufReader;
+
+    let address = listening().await;
+    let stream = tokio::net::TcpStream::connect(address).await.expect("connect");
+    let (read, mut write) = stream.into_split();
+    let mut read = BufReader::new(read);
+    let nested = Request::About {
+        name: "outer".to_string(),
+        request: Box::new(Request::About {
+            name: "inner".to_string(),
+            request: Box::new(Request::Start(shell("sleep 30"))),
+        }),
+    };
+
+    write_message(&mut write, &nested).await.expect("write");
+    match read_message(&mut read).await.expect("read") {
+        Incoming::Message(Response::Refused(agent_master_protocol::Refusal::Unreadable {
+            message,
+        })) => {
+            assert!(message.contains("cannot carry"), "{message}");
+        }
+        _ => panic!("a request inside a request inside a request was not refused"),
+    }
+    write_message(&mut write, &Request::State).await.expect("write");
+    assert!(matches!(
+        read_message::<_, Response>(&mut read).await.expect("read"),
+        Incoming::Message(Response::State(State::NotStarted))
+    ));
+
+    let mut master = AgentMaster::connect(address).await.expect("connect");
+    assert_eq!(master.process("outer").state().await.expect("state"), State::NotStarted);
+    assert_eq!(master.process("inner").state().await.expect("state"), State::NotStarted);
 }

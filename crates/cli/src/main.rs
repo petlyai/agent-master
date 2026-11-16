@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_master_client::{AgentMaster, ProcessSpec, State, WindowSize};
+use agent_master_client::{AgentMaster, Messages, Process, ProcessSpec, State, WindowSize};
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,6 +14,10 @@ struct Cli {
     /// Address the agent-master program listens on.
     #[arg(long, env = "AGENT_MASTER_ADDR")]
     server: String,
+    /// The process to drive, by the name it was started under. Left out, it is
+    /// the one started without a name.
+    #[arg(long, global = true)]
+    process: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -34,6 +38,15 @@ enum Command {
         /// Width of the window, in columns.
         #[arg(long, default_value_t = 80)]
         cols: u16,
+        /// Run it without a terminal, so that it has no window.
+        #[arg(long)]
+        no_terminal: bool,
+        /// Where a process without a terminal prints; left out, what it prints is dropped.
+        #[arg(long, requires = "no_terminal")]
+        output: Option<PathBuf>,
+        /// A unix socket the process serves WebSocket text messages on.
+        #[arg(long)]
+        message_socket: Option<PathBuf>,
         /// The command and its arguments.
         #[arg(required = true, last = true)]
         argv: Vec<String>,
@@ -87,54 +100,99 @@ enum Command {
     State,
     /// Write out what the process last put on the clipboard.
     Clipboard,
+    /// Send the process one message on its message socket: the given text, or
+    /// what is read from stdin.
+    Send {
+        /// The message. Left out, it is read from stdin instead.
+        message: Option<String>,
+    },
+    /// Write out the messages the process sent on its message socket, oldest
+    /// first, one to a line after its number and a tab.
+    Messages {
+        /// The number of the last message already taken: agent-master lets go of
+        /// it and of every one before it, for whoever else reads them too. Left
+        /// out, nothing is let go of.
+        #[arg(long, default_value_t = 0)]
+        last_taken: u64,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut master = AgentMaster::connect(&cli.server).await?;
+    let name = cli.process.as_deref();
     match cli.command {
-        Command::Start { cwd, env, rows, cols, argv } => {
+        Command::Start { cwd, env, rows, cols, no_terminal, output, message_socket, argv } => {
             let (command, args) = argv.split_first().ok_or_else(|| anyhow!("no command given"))?;
             let spec = ProcessSpec {
                 command: command.clone(),
                 args: args.to_vec(),
                 cwd,
                 env: BTreeMap::from_iter(env),
-                size: WindowSize { rows, cols },
+                terminal: (!no_terminal).then_some(WindowSize { rows, cols }),
+                output,
+                message_socket,
             };
-            println!("{}", describe(&master.start(spec).await?));
+            println!("{}", describe(&driven(&mut master, name).start(spec).await?));
         }
-        Command::Window { freeze } => show(&mut master, freeze).await?,
+        Command::Window { freeze } => show(&mut master, name, freeze).await?,
         Command::Input { text } => {
             let data = match text {
                 Some(text) => text.into_bytes(),
-                None => {
-                    let mut data = Vec::new();
-                    tokio::io::stdin().read_to_end(&mut data).await?;
-                    data
-                }
+                None => read_stdin().await?,
             };
-            master.input(&data).await?;
+            driven(&mut master, name).input(&data).await?;
         }
-        Command::Resize { rows, cols } => master.resize(WindowSize { rows, cols }).await?,
+        Command::Resize { rows, cols } => {
+            driven(&mut master, name).resize(WindowSize { rows, cols }).await?
+        }
         Command::Stop { grace_ms } => {
-            println!("{}", describe(&master.stop(Duration::from_millis(grace_ms)).await?));
+            let stopped = driven(&mut master, name).stop(Duration::from_millis(grace_ms)).await?;
+            println!("{}", describe(&stopped));
         }
-        Command::State => println!("{}", describe(&master.state().await?)),
+        Command::State => println!("{}", describe(&driven(&mut master, name).state().await?)),
         Command::Clipboard => {
             let mut stdout = tokio::io::stdout();
-            stdout.write_all(&master.clipboard().await?.unwrap_or_default()).await?;
+            let copied = driven(&mut master, name).clipboard().await?;
+            stdout.write_all(&copied.unwrap_or_default()).await?;
             stdout.flush().await?;
+        }
+        Command::Send { message } => {
+            let message = match message {
+                Some(message) => message,
+                None => String::from_utf8(read_stdin().await?)?,
+            };
+            driven(&mut master, name).send(message).await?;
+        }
+        Command::Messages { last_taken } => {
+            let Messages { first, messages } =
+                driven(&mut master, name).messages(last_taken).await?;
+            for (number, message) in (first..).zip(messages) {
+                println!("{number}\t{message}");
+            }
         }
     }
     Ok(())
 }
 
-async fn show(master: &mut AgentMaster, freeze: bool) -> Result<()> {
+fn driven<'a>(master: &'a mut AgentMaster, name: Option<&str>) -> Process<'a> {
+    match name {
+        Some(name) => master.process(name),
+        None => master.unnamed_process(),
+    }
+}
+
+async fn read_stdin() -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    tokio::io::stdin().read_to_end(&mut data).await?;
+    Ok(data)
+}
+
+async fn show(master: &mut AgentMaster, name: Option<&str>, freeze: bool) -> Result<()> {
     use std::io::Write;
 
-    let mut shown = master.window().await?.contents;
+    let mut shown = driven(master, name).window().await?.contents;
     if !(std::io::stdout().is_terminal() && std::io::stdin().is_terminal()) {
         std::io::stdout().write_all(&shown)?;
         return Ok(std::io::stdout().flush()?);
@@ -151,7 +209,7 @@ async fn show(master: &mut AgentMaster, freeze: bool) -> Result<()> {
         if freeze {
             continue;
         }
-        let next = master.window().await?.contents;
+        let next = driven(master, name).window().await?.contents;
         if next != shown {
             draw(&next)?;
             shown = next;
@@ -252,12 +310,15 @@ fn describe(state: &State) -> String {
                 (None, Some(signal)) => format!("killed by signal {signal}"),
                 (None, None) => "ended for an unknown reason".to_string(),
             };
-            format!(
-                "exited: {ending}; last window {}x{}, {} bytes",
-                window.size.rows,
-                window.size.cols,
-                window.contents.len()
-            )
+            match window {
+                Some(window) => format!(
+                    "exited: {ending}; last window {}x{}, {} bytes",
+                    window.size.rows,
+                    window.size.cols,
+                    window.contents.len()
+                ),
+                None => format!("exited: {ending}"),
+            }
         }
     }
 }
@@ -285,13 +346,65 @@ mod tests {
     #[test]
     fn starting_takes_the_command_after_a_double_dash_and_fills_in_the_rest() {
         let cli = parse(&["amctl", "--server", "here:1", "start", "--", "sh", "-c", "echo hi"]);
-        let Command::Start { cwd, env, rows, cols, argv } = cli.command else {
+        let Command::Start { cwd, env, rows, cols, no_terminal, output, message_socket, argv } =
+            cli.command
+        else {
             panic!("expected a start");
         };
         assert_eq!(cwd, PathBuf::from("."));
         assert!(env.is_empty());
         assert_eq!((rows, cols), (24, 80));
+        assert!(!no_terminal);
+        assert_eq!((output, message_socket), (None, None));
         assert_eq!(argv, vec!["sh", "-c", "echo hi"]);
+        assert_eq!(cli.process, None);
+    }
+
+    #[test]
+    fn a_process_started_without_a_terminal_may_say_where_it_prints_and_listens() {
+        let cli = parse(&[
+            "amctl",
+            "--server",
+            "here:1",
+            "--process",
+            "app-server",
+            "start",
+            "--no-terminal",
+            "--output",
+            "/state/log",
+            "--message-socket",
+            "/state/sock",
+            "--",
+            "codex",
+        ]);
+        assert_eq!(cli.process.as_deref(), Some("app-server"));
+        let Command::Start { no_terminal, output, message_socket, .. } = cli.command else {
+            panic!("expected a start");
+        };
+        assert!(no_terminal);
+        assert_eq!(output, Some(PathBuf::from("/state/log")));
+        assert_eq!(message_socket, Some(PathBuf::from("/state/sock")));
+    }
+
+    #[test]
+    fn an_output_is_for_a_process_without_a_terminal_only() {
+        assert!(Cli::try_parse_from([
+            "amctl",
+            "--server",
+            "here:1",
+            "start",
+            "--output",
+            "/state/log",
+            "--",
+            "sh"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn the_process_may_be_named_after_the_command_too() {
+        let cli = parse(&["amctl", "--server", "here:1", "state", "--process", "connector"]);
+        assert_eq!(cli.process.as_deref(), Some("connector"));
     }
 
     #[test]
@@ -361,11 +474,15 @@ mod tests {
     fn each_state_reads_plainly() {
         assert_eq!(describe(&State::NotStarted), "not started");
         assert_eq!(describe(&State::Running), "running");
-        assert!(describe(&State::Exited { code: Some(7), signal: None, window: window() })
+        assert!(describe(&State::Exited { code: Some(7), signal: None, window: Some(window()) })
             .starts_with("exited: exit code 7; last window 24x80, 12 bytes"));
-        assert!(describe(&State::Exited { code: None, signal: Some(9), window: window() })
+        assert!(describe(&State::Exited { code: None, signal: Some(9), window: Some(window()) })
             .contains("killed by signal 9"));
-        assert!(describe(&State::Exited { code: None, signal: None, window: window() })
+        assert!(describe(&State::Exited { code: None, signal: None, window: Some(window()) })
             .contains("ended for an unknown reason"));
+        assert_eq!(
+            describe(&State::Exited { code: Some(0), signal: None, window: None }),
+            "exited: exit code 0"
+        );
     }
 }

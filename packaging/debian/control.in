@@ -7,10 +7,11 @@ Section: utils
 Priority: optional
 Homepage: https://github.com/sibatabot/agent-master
 Depends: libc6
-Description: AgentMaster — owns one process and the terminal it runs in
- Runs a single program under a terminal of its own and hands control of it
- over a port: start it, read its window, type into it, resize the window,
- read its clipboard, stop it, ask how it ended.
+Description: AgentMaster — owns an agent's processes and their terminals
+ Runs an agent's programs, each under a terminal of its own or without one,
+ and hands control of them over a port: start one, read its window, type into
+ it, resize the window, read its clipboard, pass messages to it and back,
+ stop it, ask how it ended.
  .
  Installed as /usr/bin/svora-am. Whoever needs one starts it — the svora
  supervisor starts one per agent — so this package ships no service unit

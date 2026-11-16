@@ -17,5 +17,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "
 [dev-dependencies]
 agent-master = { path = "../daemon" }
 base64.workspace = true
+futures-util.workspace = true
+tempfile = "3.10"
+tokio-tungstenite.workspace = true
 vt100.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "process", "time"] }

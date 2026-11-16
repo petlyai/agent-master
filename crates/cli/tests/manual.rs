@@ -3,7 +3,7 @@ use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_master::{serve, Session};
+use agent_master::{serve, Processes};
 use agent_master_client::{AgentMaster, ProcessSpec, State, WindowSize};
 use base64::Engine;
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use tokio::process::Command;
 async fn listening() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("bound address");
-    tokio::spawn(serve(listener, Arc::new(Session::new())));
+    tokio::spawn(serve(listener, Arc::new(Processes::new())));
     address
 }
 
@@ -151,7 +151,7 @@ async fn an_empty_clipboard_comes_out_of_amctl_as_nothing_at_all() {
 async fn amctl_under_a_terminal(watched: &SocketAddr, extra: &[&str]) -> AgentMaster {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("bound address");
-    tokio::spawn(serve(listener, Arc::new(Session::new())));
+    tokio::spawn(serve(listener, Arc::new(Processes::new())));
 
     let mut seat = AgentMaster::connect(address).await.expect("connect");
     let spec = ProcessSpec {
@@ -163,7 +163,9 @@ async fn amctl_under_a_terminal(watched: &SocketAddr, extra: &[&str]) -> AgentMa
             .collect(),
         cwd: std::env::temp_dir(),
         env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
-        size: WindowSize { rows: 24, cols: 80 },
+        terminal: Some(WindowSize { rows: 24, cols: 80 }),
+        output: None,
+        message_socket: None,
     };
     seat.start(spec).await.expect("start amctl under a terminal");
     seat
@@ -238,7 +240,7 @@ async fn the_terminal_is_left_as_it_was_found() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("bound address");
-    tokio::spawn(serve(listener, Arc::new(Session::new())));
+    tokio::spawn(serve(listener, Arc::new(Processes::new())));
     let mut seat = AgentMaster::connect(address).await.expect("connect");
     let after_the_view = format!(
         "{} --server {watched} window; printf 'AFTER\\r\\n'; read _",
@@ -249,7 +251,9 @@ async fn the_terminal_is_left_as_it_was_found() {
         args: vec!["-c".to_string(), after_the_view],
         cwd: std::env::temp_dir(),
         env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
-        size: WindowSize { rows: 24, cols: 80 },
+        terminal: Some(WindowSize { rows: 24, cols: 80 }),
+        output: None,
+        message_socket: None,
     };
     seat.start(spec).await.expect("start");
     seat_showing(&mut seat, "RED AND HIDDEN").await;
@@ -320,5 +324,150 @@ async fn a_refusal_ends_amctl_with_the_reason() {
     let run = amctl(&address, &["input", "nothing is running"]).await;
     assert!(!run.status.success());
     let complaint = String::from_utf8_lossy(&run.stderr);
-    assert!(complaint.contains("no process has been started"), "{complaint}");
+    assert!(complaint.contains("the process has not been started"), "{complaint}");
+}
+
+type FarEnd = tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>;
+
+fn far_end_at(socket: &std::path::Path) -> tokio::task::JoinHandle<FarEnd> {
+    let listener = tokio::net::UnixListener::bind(socket).expect("bind");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        tokio_tungstenite::accept_async(stream).await.expect("a websocket")
+    })
+}
+
+async fn heard(far_end: &mut FarEnd) -> String {
+    use futures_util::StreamExt;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), far_end.next()).await.expect("in time") {
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                return text.to_string()
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("nothing was sent: {other:?}"),
+        }
+    }
+}
+
+async fn started_without_a_terminal(
+    address: &SocketAddr,
+    dir: &std::path::Path,
+) -> std::path::PathBuf {
+    let socket = dir.join("messages.sock");
+    let output = dir.join("output");
+    let started = amctl(
+        address,
+        &[
+            "--process",
+            "server",
+            "start",
+            "--no-terminal",
+            "--output",
+            output.to_str().expect("a printable path"),
+            "--message-socket",
+            socket.to_str().expect("a printable path"),
+            "--",
+            "sh",
+            "-c",
+            "echo printed; sleep 30",
+        ],
+    )
+    .await;
+    assert_eq!(said(&started), "running");
+    socket
+}
+
+#[tokio::test]
+async fn a_named_process_without_a_terminal_is_driven_by_hand_messages_included() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let address = listening().await;
+    let dir = tempfile::tempdir().expect("a directory");
+    let socket = dir.path().join("messages.sock");
+    let far_end = far_end_at(&socket);
+    started_without_a_terminal(&address, dir.path()).await;
+    assert_eq!(said(&amctl(&address, &["state"]).await), "not started");
+    assert_eq!(said(&amctl(&address, &["--process", "server", "state"]).await), "running");
+
+    assert!(said(&amctl(&address, &["--process", "server", "send", "hello"]).await).is_empty());
+    let mut far_end = far_end.await.expect("the far end");
+    assert_eq!(heard(&mut far_end).await, "hello");
+    far_end.send(Message::text("one")).await.expect("send");
+    far_end.send(Message::text("two")).await.expect("send");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    for _ in 0..2 {
+        let run = amctl(&address, &["--process", "server", "messages"]).await;
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            "1\tone\n2\ttwo\n",
+            "nothing is let go of by default"
+        );
+    }
+    let after_one =
+        amctl(&address, &["--process", "server", "messages", "--last-taken", "1"]).await;
+    assert_eq!(String::from_utf8_lossy(&after_one.stdout), "2\ttwo\n");
+
+    for refused in [
+        &["window"][..],
+        &["input", "x"],
+        &["resize", "--rows", "9", "--cols", "9"],
+        &["clipboard"],
+    ] {
+        let run = amctl(&address, &[&["--process", "server"][..], refused].concat()).await;
+        assert!(!run.status.success(), "{refused:?}");
+        let complaint = String::from_utf8_lossy(&run.stderr);
+        assert!(complaint.contains("without a terminal"), "{refused:?}: {complaint}");
+    }
+
+    let stopped =
+        said(&amctl(&address, &["--process", "server", "stop", "--grace-ms", "500"]).await);
+    assert!(stopped.starts_with("exited:") && !stopped.contains("window"), "{stopped}");
+    assert_eq!(std::fs::read_to_string(dir.path().join("output")).expect("output"), "printed\n");
+}
+
+#[tokio::test]
+async fn a_message_piped_into_amctl_is_sent_byte_for_byte_and_one_that_is_not_text_is_not() {
+    let address = listening().await;
+    let dir = tempfile::tempdir().expect("a directory");
+    let far_end = far_end_at(&dir.path().join("messages.sock"));
+    started_without_a_terminal(&address, dir.path()).await;
+
+    let piped = |bytes: &'static [u8]| async move {
+        let mut sending = Command::new(env!("CARGO_BIN_EXE_amctl"))
+            .args(["--server", &address.to_string(), "--process", "server", "send"])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run amctl");
+        sending.stdin.take().expect("stdin").write_all(bytes).await.expect("write");
+        sending.wait_with_output().await.expect("wait")
+    };
+    let sent = piped(b"{\"id\":1}\n").await;
+    assert!(sent.status.success(), "{}", String::from_utf8_lossy(&sent.stderr));
+    let mut far_end = far_end.await.expect("the far end");
+    assert_eq!(heard(&mut far_end).await, "{\"id\":1}\n");
+
+    let refused = piped(b"\xff\xfe").await;
+    assert!(!refused.status.success(), "a message that is not text was taken");
+    assert!(amctl(&address, &["--process", "server", "send", "after"]).await.status.success());
+    assert_eq!(heard(&mut far_end).await, "after", "the one that is not text reached the far end");
+}
+
+#[tokio::test]
+async fn a_window_followed_by_name_is_that_process_window_and_no_other() {
+    let watched = listening().await;
+    let named = "printf 'FIRST OF THE NAMED\\n'; read _; printf 'SECOND OF THE NAMED\\n'; read _";
+    amctl(&watched, &["--process", "screen", "start", "--", "sh", "-c", named]).await;
+    amctl(&watched, &["start", "--", "sh", "-c", "printf 'THE UNNAMED ONE\\n'; read _"]).await;
+    window_showing(&watched, "THE UNNAMED ONE").await;
+
+    let mut seat = amctl_under_a_terminal(&watched, &["--process", "screen"]).await;
+    seat_showing(&mut seat, "FIRST OF THE NAMED").await;
+    amctl(&watched, &["--process", "screen", "input", "\r"]).await;
+    seat_showing(&mut seat, "SECOND OF THE NAMED").await;
+    seat_never_shows(&mut seat, "THE UNNAMED ONE").await;
 }

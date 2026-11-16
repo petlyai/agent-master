@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::os::unix::process::ExitStatusExt;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use agent_master_protocol::{ProcessSpec, Refusal, State, Window, WindowSize};
+use agent_master_protocol::{Messages, ProcessSpec, Refusal, State, Window, WindowSize};
 use anyhow::Context;
 use base64::Engine;
 use pty_process::{OwnedReadPty, OwnedWritePty};
@@ -11,13 +13,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{watch, Mutex};
 use tokio::task::{AbortHandle, JoinHandle};
 
+use crate::messages::MessageSocket;
+
 /// The emulator panics on a grid smaller than this.
 pub const LEAST_WINDOW: WindowSize = WindowSize { rows: 2, cols: 2 };
 
 const LAST_FRAME_WAIT: Duration = Duration::from_millis(200);
 
 type Screen = SyncMutex<vt100::Parser<Clipboard>>;
-type Outcome<T> = std::result::Result<T, Refusal>;
+pub(crate) type Outcome<T> = std::result::Result<T, Refusal>;
 
 #[derive(Default)]
 struct Clipboard(Option<Vec<u8>>);
@@ -35,7 +39,7 @@ impl vt100::Callbacks for Clipboard {
 struct Exit {
     code: Option<i32>,
     signal: Option<i32>,
-    window: Window,
+    window: Option<Window>,
 }
 
 struct Terminal {
@@ -123,16 +127,19 @@ impl Terminal {
 }
 
 struct Process {
-    terminal: Arc<Terminal>,
+    terminal: Option<Arc<Terminal>>,
     leader: i32,
     pid_released: Arc<AtomicBool>,
     exit: watch::Receiver<Option<Exit>>,
-    painting: AbortHandle,
+    painting: Option<AbortHandle>,
+    message_socket: Option<MessageSocket>,
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
-        self.painting.abort();
+        if let Some(painting) = &self.painting {
+            painting.abort();
+        }
     }
 }
 
@@ -141,11 +148,16 @@ impl Process {
         self.exit.borrow().is_none()
     }
 
-    fn window(&self) -> Window {
-        match &*self.exit.borrow() {
-            None => self.terminal.window(),
-            Some(exit) => exit.window.clone(),
-        }
+    fn terminal(&self) -> Outcome<&Terminal> {
+        self.terminal.as_deref().ok_or(Refusal::NoTerminal)
+    }
+
+    fn window(&self) -> Outcome<Window> {
+        let terminal = self.terminal()?;
+        Ok(match &*self.exit.borrow() {
+            Some(Exit { window: Some(last), .. }) => last.clone(),
+            _ => terminal.window(),
+        })
     }
 
     fn state(&self) -> State {
@@ -158,36 +170,50 @@ impl Process {
     }
 
     async fn input(&self, data: &[u8]) -> Outcome<()> {
+        let terminal = self.terminal()?;
         if !self.running() {
             return Err(Refusal::AlreadyExited);
         }
-        self.terminal.type_in(data).await
+        terminal.type_in(data).await
     }
 
     async fn resize(&self, size: WindowSize) -> Outcome<()> {
+        let terminal = self.terminal()?;
         if !self.running() {
             return Err(Refusal::AlreadyExited);
         }
-        self.terminal.resize(size).await
+        terminal.resize(size).await
     }
 
-    fn clipboard(&self) -> Option<Vec<u8>> {
-        self.terminal.clipboard()
+    fn clipboard(&self) -> Outcome<Option<Vec<u8>>> {
+        Ok(self.terminal()?.clipboard())
+    }
+
+    fn message_socket(&self) -> Outcome<&MessageSocket> {
+        self.message_socket.as_ref().ok_or(Refusal::NoMessageSocket)
+    }
+
+    async fn send(&self, message: String) -> Outcome<()> {
+        self.message_socket()?.send(message, self.running()).await
+    }
+
+    async fn messages(&self, last_taken: u64) -> Outcome<Messages> {
+        self.message_socket()?.messages(last_taken, self.running()).await
     }
 
     async fn stop(&self, grace: Duration) -> State {
         if self.running() {
             let mut exit = self.exit.clone();
-            self.signal_session(libc::SIGTERM);
+            self.signal_group(libc::SIGTERM);
             if tokio::time::timeout(grace, ended(&mut exit)).await.is_err() {
-                self.signal_session(libc::SIGKILL);
+                self.signal_group(libc::SIGKILL);
                 ended(&mut exit).await;
             }
         }
         self.state()
     }
 
-    fn signal_session(&self, signal: i32) {
+    fn signal_group(&self, signal: i32) {
         if self.pid_released.load(Ordering::SeqCst) {
             return;
         }
@@ -198,57 +224,103 @@ impl Process {
 }
 
 #[derive(Default)]
-pub struct Session {
-    process: Mutex<Option<Arc<Process>>>,
+pub struct Processes {
+    known: Mutex<Known>,
 }
 
-impl Session {
+#[derive(Default)]
+struct Known {
+    processes: BTreeMap<Option<String>, Arc<Process>>,
+    closed: bool,
+}
+
+impl Processes {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub async fn start(&self, spec: ProcessSpec) -> Outcome<State> {
-        let mut slot = self.process.lock().await;
-        if slot.as_ref().is_some_and(|process| process.running()) {
+    pub async fn start(&self, name: Option<&str>, spec: ProcessSpec) -> Outcome<State> {
+        let mut known = self.known.lock().await;
+        if known.closed {
+            return Err(Refusal::Failed { message: "agent-master is ending".to_string() });
+        }
+        let name = name.map(str::to_string);
+        if known.processes.get(&name).is_some_and(|earlier| earlier.running()) {
             return Err(Refusal::AlreadyRunning);
         }
-        let process = spawn(spec)?;
-        let state = process.state();
-        *slot = Some(Arc::new(process));
+        let started = spawn(spec)?;
+        let state = started.state();
+        known.processes.insert(name, Arc::new(started));
         Ok(state)
     }
 
-    pub async fn window(&self) -> Outcome<Window> {
-        Ok(self.current().await?.window())
+    pub async fn window(&self, name: Option<&str>) -> Outcome<Window> {
+        self.process(name).await?.window()
     }
 
-    pub async fn clipboard(&self) -> Outcome<Option<Vec<u8>>> {
-        Ok(self.current().await?.clipboard())
+    pub async fn clipboard(&self, name: Option<&str>) -> Outcome<Option<Vec<u8>>> {
+        self.process(name).await?.clipboard()
     }
 
-    pub async fn input(&self, data: &[u8]) -> Outcome<()> {
-        self.current().await?.input(data).await
+    pub async fn input(&self, name: Option<&str>, data: &[u8]) -> Outcome<()> {
+        self.process(name).await?.input(data).await
     }
 
-    pub async fn resize(&self, size: WindowSize) -> Outcome<()> {
-        self.current().await?.resize(size).await
+    pub async fn resize(&self, name: Option<&str>, size: WindowSize) -> Outcome<()> {
+        self.process(name).await?.resize(size).await
     }
 
-    pub async fn stop(&self, grace: Duration) -> Outcome<State> {
-        Ok(self.current().await?.stop(grace).await)
+    pub async fn stop(&self, name: Option<&str>, grace: Duration) -> Outcome<State> {
+        Ok(self.process(name).await?.stop(grace).await)
     }
 
-    pub async fn state(&self) -> State {
-        self.process.lock().await.as_ref().map_or(State::NotStarted, |process| process.state())
+    pub async fn state(&self, name: Option<&str>) -> State {
+        let known = self.known.lock().await;
+        let process = known.processes.get(&name.map(str::to_string));
+        process.map_or(State::NotStarted, |process| process.state())
     }
 
-    async fn current(&self) -> Outcome<Arc<Process>> {
-        self.process.lock().await.clone().ok_or(Refusal::NothingStarted)
+    pub async fn send(&self, name: Option<&str>, message: String) -> Outcome<()> {
+        self.process(name).await?.send(message).await
+    }
+
+    pub async fn messages(&self, name: Option<&str>, last_taken: u64) -> Outcome<Messages> {
+        self.process(name).await?.messages(last_taken).await
+    }
+
+    pub async fn close(&self, grace: Duration) {
+        let all: Vec<Arc<Process>> = {
+            let mut known = self.known.lock().await;
+            known.closed = true;
+            known.processes.values().cloned().collect()
+        };
+        let stopping = all.iter().map(|process| process.stop(grace));
+        futures_util::future::join_all(stopping).await;
+    }
+
+    async fn process(&self, name: Option<&str>) -> Outcome<Arc<Process>> {
+        let known = self.known.lock().await;
+        known.processes.get(&name.map(str::to_string)).cloned().ok_or(Refusal::NotStarted)
     }
 }
 
 fn spawn(spec: ProcessSpec) -> Outcome<Process> {
-    let (terminal, pts, painting) = Terminal::open(spec.size)?;
+    match spec.terminal {
+        Some(size) => spawn_under_a_terminal(spec, size),
+        None => spawn_without_a_terminal(spec),
+    }
+}
+
+fn spawn_under_a_terminal(spec: ProcessSpec, size: WindowSize) -> Outcome<Process> {
+    if let Some(output) = &spec.output {
+        return Err(Refusal::Failed {
+            message: format!(
+                "a process under a terminal prints to its terminal, not to {}",
+                output.display()
+            ),
+        });
+    }
+    let (terminal, pts, painting) = Terminal::open(size)?;
 
     let child = pty_process::Command::new(&spec.command)
         .args(&spec.args)
@@ -257,25 +329,84 @@ fn spawn(spec: ProcessSpec) -> Outcome<Process> {
         .spawn(pts)
         .with_context(|| format!("spawning {}", spec.command))
         .map_err(failed)?;
-    let pid = child
-        .id()
-        .context("the spawned process has no pid")
-        .and_then(|pid| i32::try_from(pid).context("the spawned process has an unreadable pid"))
-        .map_err(failed)?;
+    let leader = pid_of(&child)?;
 
     let (exit_tx, exit_rx) = watch::channel(None);
     let abandon = painting.abort_handle();
     let pid_released = Arc::new(AtomicBool::new(false));
-    tokio::spawn(reap(child, painting, terminal.clone(), pid_released.clone(), exit_tx));
+    let last_window = {
+        let terminal = terminal.clone();
+        async move {
+            let _ = tokio::time::timeout(LAST_FRAME_WAIT, painting).await;
+            Some(terminal.window())
+        }
+    };
+    tokio::spawn(reap(child, pid_released.clone(), exit_tx, last_window));
 
-    Ok(Process { terminal, leader: pid, pid_released, exit: exit_rx, painting: abandon })
+    Ok(Process {
+        terminal: Some(terminal),
+        leader,
+        pid_released,
+        exit: exit_rx,
+        painting: Some(abandon),
+        message_socket: spec.message_socket.map(MessageSocket::at),
+    })
+}
+
+fn spawn_without_a_terminal(spec: ProcessSpec) -> Outcome<Process> {
+    let (stdout, stderr) = match &spec.output {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("opening {}", path.display()))
+                .map_err(failed)?;
+            let shared = file.try_clone().context("sharing the output").map_err(failed)?;
+            (Stdio::from(file), Stdio::from(shared))
+        }
+        None => (Stdio::null(), Stdio::null()),
+    };
+    let child = tokio::process::Command::new(&spec.command)
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .envs(spec.env)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("spawning {}", spec.command))
+        .map_err(failed)?;
+    let leader = pid_of(&child)?;
+
+    let (exit_tx, exit_rx) = watch::channel(None);
+    let pid_released = Arc::new(AtomicBool::new(false));
+    tokio::spawn(reap(child, pid_released.clone(), exit_tx, async { None }));
+
+    Ok(Process {
+        terminal: None,
+        leader,
+        pid_released,
+        exit: exit_rx,
+        painting: None,
+        message_socket: spec.message_socket.map(MessageSocket::at),
+    })
+}
+
+fn pid_of(child: &tokio::process::Child) -> Outcome<i32> {
+    child
+        .id()
+        .context("the spawned process has no pid")
+        .and_then(|pid| i32::try_from(pid).context("the spawned process has an unreadable pid"))
+        .map_err(failed)
 }
 
 fn painted(screen: &Screen) -> MutexGuard<'_, vt100::Parser<Clipboard>> {
     screen.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn failed(error: anyhow::Error) -> Refusal {
+pub(crate) fn failed(error: anyhow::Error) -> Refusal {
     Refusal::Failed { message: format!("{error:#}") }
 }
 
@@ -289,14 +420,13 @@ async fn ended(exit: &mut watch::Receiver<Option<Exit>>) {
 
 async fn reap(
     mut child: tokio::process::Child,
-    painting: JoinHandle<()>,
-    terminal: Arc<Terminal>,
     pid_released: Arc<AtomicBool>,
     exit: watch::Sender<Option<Exit>>,
+    last_window: impl std::future::Future<Output = Option<Window>>,
 ) {
     let status = child.wait().await;
     pid_released.store(true, Ordering::SeqCst);
-    let _ = tokio::time::timeout(LAST_FRAME_WAIT, painting).await;
+    let window = last_window.await;
     let (code, signal) = match status {
         Ok(status) => (status.code(), status.signal()),
         Err(error) => {
@@ -304,7 +434,7 @@ async fn reap(
             (None, None)
         }
     };
-    let _ = exit.send(Some(Exit { code, signal, window: terminal.window() }));
+    let _ = exit.send(Some(Exit { code, signal, window }));
 }
 
 #[cfg(test)]

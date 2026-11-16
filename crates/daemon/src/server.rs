@@ -6,26 +6,26 @@ use anyhow::Result;
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::session::Session;
+use crate::processes::{Outcome, Processes};
 
-pub async fn serve(listener: TcpListener, session: Arc<Session>) -> Result<()> {
+pub async fn serve(listener: TcpListener, processes: Arc<Processes>) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
-        let session = session.clone();
+        let processes = processes.clone();
         tokio::spawn(async move {
-            if let Err(error) = converse(stream, session).await {
+            if let Err(error) = converse(stream, processes).await {
                 log::warn!("connection from {peer} ended: {error}");
             }
         });
     }
 }
 
-async fn converse(stream: TcpStream, session: Arc<Session>) -> Result<()> {
+async fn converse(stream: TcpStream, processes: Arc<Processes>) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     loop {
         let response = match read_message(&mut read).await? {
-            Incoming::Message(request) => act(&session, request).await,
+            Incoming::Message(request) => act(&processes, request).await,
             Incoming::Unreadable(message) => Response::Refused(Refusal::Unreadable { message }),
             Incoming::Ended => return Ok(()),
         };
@@ -33,17 +33,33 @@ async fn converse(stream: TcpStream, session: Arc<Session>) -> Result<()> {
     }
 }
 
-async fn act(session: &Session, request: Request) -> Response {
+async fn act(processes: &Processes, request: Request) -> Response {
     let done = match request {
-        Request::Start(spec) => session.start(spec).await.map(Response::State),
-        Request::Window => session.window().await.map(Response::Window),
-        Request::Input { data } => session.input(&data).await.map(|()| Response::Done),
-        Request::Resize { size } => session.resize(size).await.map(|()| Response::Done),
-        Request::Stop { grace_ms } => {
-            session.stop(Duration::from_millis(grace_ms)).await.map(Response::State)
-        }
-        Request::State => Ok(Response::State(session.state().await)),
-        Request::Clipboard => session.clipboard().await.map(|data| Response::Clipboard { data }),
+        Request::About { name, request } => act_on(processes, Some(&name), *request).await,
+        request => act_on(processes, None, request).await,
     };
     done.unwrap_or_else(Response::Refused)
+}
+
+async fn act_on(processes: &Processes, name: Option<&str>, request: Request) -> Outcome<Response> {
+    match request {
+        Request::Start(spec) => processes.start(name, spec).await.map(Response::State),
+        Request::Window => processes.window(name).await.map(Response::Window),
+        Request::Input { data } => processes.input(name, &data).await.map(|()| Response::Done),
+        Request::Resize { size } => processes.resize(name, size).await.map(|()| Response::Done),
+        Request::Stop { grace_ms } => {
+            processes.stop(name, Duration::from_millis(grace_ms)).await.map(Response::State)
+        }
+        Request::State => Ok(Response::State(processes.state(name).await)),
+        Request::Clipboard => {
+            processes.clipboard(name).await.map(|data| Response::Clipboard { data })
+        }
+        Request::Send { message } => processes.send(name, message).await.map(|()| Response::Done),
+        Request::Messages { last_taken } => {
+            processes.messages(name, last_taken).await.map(Response::Messages)
+        }
+        Request::About { .. } => Err(Refusal::Unreadable {
+            message: "a request about a named process cannot carry one about another".to_string(),
+        }),
+    }
 }

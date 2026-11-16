@@ -5,7 +5,7 @@ use tokio::io::BufReader;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
 
-pub use agent_master_protocol::{ProcessSpec, Refusal, State, Window, WindowSize};
+pub use agent_master_protocol::{Messages, ProcessSpec, Refusal, State, Window, WindowSize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -35,39 +35,48 @@ impl AgentMaster {
         Ok(Self { write, read: BufReader::new(read) })
     }
 
+    pub fn process(&mut self, name: &str) -> Process<'_> {
+        Process { master: self, name: Some(name.to_string()) }
+    }
+
+    pub fn unnamed_process(&mut self) -> Process<'_> {
+        Process { master: self, name: None }
+    }
+
     pub async fn start(&mut self, spec: ProcessSpec) -> Result<State> {
-        expect_state(self.ask(Request::Start(spec)).await?, "start")
+        self.unnamed_process().start(spec).await
     }
 
     pub async fn window(&mut self) -> Result<Window> {
-        match self.ask(Request::Window).await? {
-            Response::Window(window) => Ok(window),
-            other => Err(mismatch("window", &other)),
-        }
+        self.unnamed_process().window().await
     }
 
     pub async fn input(&mut self, data: &[u8]) -> Result<()> {
-        expect_done(self.ask(Request::Input { data: data.to_vec() }).await?, "input")
+        self.unnamed_process().input(data).await
     }
 
     pub async fn resize(&mut self, size: WindowSize) -> Result<()> {
-        expect_done(self.ask(Request::Resize { size }).await?, "resize")
+        self.unnamed_process().resize(size).await
     }
 
     pub async fn stop(&mut self, grace: Duration) -> Result<State> {
-        let request = Request::Stop { grace_ms: grace.as_millis().try_into().unwrap_or(u64::MAX) };
-        expect_state(self.ask(request).await?, "stop")
+        self.unnamed_process().stop(grace).await
     }
 
     pub async fn state(&mut self) -> Result<State> {
-        expect_state(self.ask(Request::State).await?, "state")
+        self.unnamed_process().state().await
     }
 
     pub async fn clipboard(&mut self) -> Result<Option<Vec<u8>>> {
-        match self.ask(Request::Clipboard).await? {
-            Response::Clipboard { data } => Ok(data),
-            other => Err(mismatch("clipboard", &other)),
-        }
+        self.unnamed_process().clipboard().await
+    }
+
+    pub async fn send(&mut self, message: String) -> Result<()> {
+        self.unnamed_process().send(message).await
+    }
+
+    pub async fn messages(&mut self, last_taken: u64) -> Result<Messages> {
+        self.unnamed_process().messages(last_taken).await
     }
 
     async fn ask(&mut self, request: Request) -> Result<Response> {
@@ -78,6 +87,67 @@ impl AgentMaster {
             Incoming::Unreadable(message) => Err(Error::Unreadable(message)),
             Incoming::Ended => Err(Error::HungUp),
         }
+    }
+}
+
+pub struct Process<'a> {
+    master: &'a mut AgentMaster,
+    name: Option<String>,
+}
+
+impl Process<'_> {
+    pub async fn start(self, spec: ProcessSpec) -> Result<State> {
+        expect_state(self.ask(Request::Start(spec)).await?, "start")
+    }
+
+    pub async fn window(self) -> Result<Window> {
+        match self.ask(Request::Window).await? {
+            Response::Window(window) => Ok(window),
+            other => Err(mismatch("window", &other)),
+        }
+    }
+
+    pub async fn input(self, data: &[u8]) -> Result<()> {
+        expect_done(self.ask(Request::Input { data: data.to_vec() }).await?, "input")
+    }
+
+    pub async fn resize(self, size: WindowSize) -> Result<()> {
+        expect_done(self.ask(Request::Resize { size }).await?, "resize")
+    }
+
+    pub async fn stop(self, grace: Duration) -> Result<State> {
+        let grace_ms = grace.as_millis().try_into().unwrap_or(u64::MAX);
+        expect_state(self.ask(Request::Stop { grace_ms }).await?, "stop")
+    }
+
+    pub async fn state(self) -> Result<State> {
+        expect_state(self.ask(Request::State).await?, "state")
+    }
+
+    pub async fn clipboard(self) -> Result<Option<Vec<u8>>> {
+        match self.ask(Request::Clipboard).await? {
+            Response::Clipboard { data } => Ok(data),
+            other => Err(mismatch("clipboard", &other)),
+        }
+    }
+
+    pub async fn send(self, message: String) -> Result<()> {
+        expect_done(self.ask(Request::Send { message }).await?, "send")
+    }
+
+    pub async fn messages(self, last_taken: u64) -> Result<Messages> {
+        match self.ask(Request::Messages { last_taken }).await? {
+            Response::Messages(messages) => Ok(messages),
+            other => Err(mismatch("messages", &other)),
+        }
+    }
+
+    async fn ask(self, request: Request) -> Result<Response> {
+        let request = match self.name {
+            Some(name) => Request::About { name, request: Box::new(request) },
+            None => request,
+        };
+        self.master.ask(request).await
     }
 }
 
@@ -101,6 +171,7 @@ fn mismatch(asked: &'static str, answer: &Response) -> Error {
         Response::Window(_) => "a window",
         Response::State(_) => "a state",
         Response::Clipboard { .. } => "a clipboard",
+        Response::Messages(_) => "messages",
         Response::Refused(_) => "a refusal",
     };
     Error::Mismatched { asked, answer }

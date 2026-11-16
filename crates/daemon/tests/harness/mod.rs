@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_master::{serve, Session};
+use agent_master::{serve, Processes};
 use agent_master_client::{AgentMaster, Error, ProcessSpec, Refusal, State, Window, WindowSize};
 use base64::Engine;
 use tokio::net::TcpListener;
@@ -15,7 +15,7 @@ pub const PATIENCE: Duration = Duration::from_secs(5);
 pub async fn listening() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("bound address");
-    tokio::spawn(serve(listener, Arc::new(Session::new())));
+    tokio::spawn(serve(listener, Arc::new(Processes::new())));
     address
 }
 
@@ -29,7 +29,9 @@ pub fn spec(argv: &[&str]) -> ProcessSpec {
         args: argv[1..].iter().map(|arg| (*arg).to_string()).collect(),
         cwd: std::env::temp_dir(),
         env: BTreeMap::new(),
-        size: WindowSize { rows: 24, cols: 80 },
+        terminal: Some(WindowSize { rows: 24, cols: 80 }),
+        output: None,
+        message_socket: None,
     }
 }
 
@@ -96,7 +98,52 @@ pub fn exit_code(state: &State) -> Option<i32> {
 
 pub fn last_window(state: &State) -> &Window {
     match state {
-        State::Exited { window, .. } => window,
+        State::Exited { window: Some(window), .. } => window,
         other => panic!("expected an ended process, got {other:?}"),
     }
+}
+
+pub fn without_a_terminal(script: &str) -> ProcessSpec {
+    ProcessSpec { terminal: None, ..shell(script) }
+}
+
+pub async fn ended_as(master: &mut AgentMaster, name: &str) -> State {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let state = master.process(name).state().await.expect("state");
+        if !matches!(state, State::Running) {
+            return state;
+        }
+        assert!(Instant::now() < deadline, "{name} never ended");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+pub async fn written(path: &std::path::Path) -> String {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let Ok(read) = std::fs::read_to_string(path) {
+            if !read.is_empty() {
+                return read;
+            }
+        }
+        assert!(Instant::now() < deadline, "{} never came", path.display());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether the process is gone, or left at most a zombie for whoever inherited it.
+pub async fn gone(pid: i32) -> bool {
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        match status {
+            Err(_) => return true,
+            Ok(stat) if stat.rsplit(") ").next().is_some_and(|rest| rest.starts_with('Z')) => {
+                return true
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    false
 }

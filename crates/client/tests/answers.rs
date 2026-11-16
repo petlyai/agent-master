@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use agent_master_client::{AgentMaster, Error, ProcessSpec, Refusal, WindowSize};
+use agent_master_client::{AgentMaster, Error, Messages, ProcessSpec, Refusal, WindowSize};
 use agent_master_protocol::{write_message, Response, State, Window};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -151,7 +151,9 @@ async fn an_answer_to_a_start_that_is_not_a_state_is_reported() {
         args: Vec::new(),
         cwd: PathBuf::from("/"),
         env: BTreeMap::new(),
-        size: WindowSize { rows: 24, cols: 80 },
+        terminal: Some(WindowSize { rows: 24, cols: 80 }),
+        output: None,
+        message_socket: None,
     };
     let error = master.start(spec).await.expect_err("start");
     assert!(matches!(error, Error::Mismatched { asked: "start", answer: "done" }), "{error}");
@@ -179,6 +181,53 @@ async fn the_grace_travels_as_whole_milliseconds_and_never_overflows() {
     }
 }
 
+#[tokio::test]
+async fn a_named_process_is_asked_about_inside_a_request_that_names_it() {
+    let (address, asked) = listening(Some(Frame::Reply(Response::State(State::Running)))).await;
+    let mut master = AgentMaster::connect(address).await.expect("connect");
+    master.process("app-server").state().await.expect("state");
+    let heard = asked.lock().expect("heard").concat();
+    assert_eq!(heard.trim_end(), r#"{"op":"about","name":"app-server","request":{"op":"state"}}"#);
+
+    let (address, asked) = listening(Some(Frame::Reply(Response::State(State::Running)))).await;
+    let mut master = AgentMaster::connect(address).await.expect("connect");
+    master.unnamed_process().state().await.expect("state");
+    assert_eq!(asked.lock().expect("heard").concat().trim_end(), r#"{"op":"state"}"#);
+}
+
+#[tokio::test]
+async fn a_message_is_sent_as_given_and_what_came_back_is_handed_over_with_its_number() {
+    let (address, asked) = listening(Some(Frame::Reply(Response::Done))).await;
+    let mut master = AgentMaster::connect(address).await.expect("connect");
+    master.process("app-server").send(r#"{"id":1}"#.to_string()).await.expect("send");
+    let heard = asked.lock().expect("heard").concat();
+    assert!(heard.contains(r#""message":"{\"id\":1}""#), "{heard}");
+
+    let sent = Messages { first: 3, messages: vec!["one".to_string(), "two".to_string()] };
+    let (address, asked) = listening(Some(Frame::Reply(Response::Messages(sent.clone())))).await;
+    let mut master = AgentMaster::connect(address).await.expect("connect");
+    assert_eq!(master.process("app-server").messages(2).await.expect("messages"), sent);
+    assert!(asked.lock().expect("heard").concat().contains(r#""last_taken":2"#));
+}
+
+#[tokio::test]
+async fn an_answer_to_a_message_that_does_not_fit_is_reported() {
+    let address = answering(Response::State(State::Running)).await;
+    let mut master = AgentMaster::connect(address).await.expect("connect");
+    let error = master.send("x".to_string()).await.expect_err("send");
+    assert!(matches!(error, Error::Mismatched { asked: "send", answer: "a state" }), "{error}");
+
+    let address = answering(Response::Done).await;
+    let mut master = AgentMaster::connect(address).await.expect("connect");
+    let error = master.messages(0).await.expect_err("messages");
+    assert!(matches!(error, Error::Mismatched { asked: "messages", answer: "done" }), "{error}");
+
+    let address = answering(Response::Messages(Messages { first: 1, messages: Vec::new() })).await;
+    let mut master = AgentMaster::connect(address).await.expect("connect");
+    let error = master.state().await.expect_err("state");
+    assert!(matches!(error, Error::Mismatched { asked: "state", answer: "messages" }), "{error}");
+}
+
 #[test]
 fn every_complaint_reads_plainly() {
     let unreachable =
@@ -191,7 +240,7 @@ fn every_complaint_reads_plainly() {
     );
     assert_eq!(
         Error::Refused(Refusal::AlreadyRunning).to_string(),
-        "agent-master refused: a process is already running"
+        "agent-master refused: the process is already running"
     );
     assert_eq!(
         Error::Mismatched { asked: "state", answer: "done" }.to_string(),
