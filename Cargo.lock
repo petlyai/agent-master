@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-master"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-master-client",
  "agent-master-protocol",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "agent-master-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-master",
  "agent-master-client",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "agent-master-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-master-protocol",
  "serde_json",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "agent-master-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "serde",
